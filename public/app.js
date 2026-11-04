@@ -26,9 +26,20 @@ const initials = (name) => {
 	return ((parts[0]?.[0] || '?') + (parts[1]?.[0] || '')).toUpperCase()
 }
 function avatarHTML(id, name, cls = '') {
-	return `<div class="avatar ${cls}" style="background:${colorFor(id)}">${esc(initials(name))}<img loading="lazy" src="/avatar/${enc(id)}" alt="" onerror="this.remove()"></div>`
+	return `<div class="avatar ${cls}" style="background:${colorFor(id)}">${esc(initials(name))}<img loading="lazy" src="/avatar/${enc(S.acc || 'main')}/${enc(id)}" alt="" onerror="this.remove()"></div>`
 }
 
+const mediaUrl = (m) => `/media/${enc(S.acc || 'main')}/${enc(m.chatId)}/${enc(m.id)}`
+const isNarrow = () => matchMedia('(max-width: 760px)').matches
+function jumpToMessage(id) {
+	const el = document.querySelector(`#msg-list [data-mid="${CSS.escape(id)}"]`)
+	if (!el) return false
+	el.scrollIntoView({ block: 'center' })
+	el.classList.add('flash')
+	setTimeout(() => el.classList.remove('flash'), 1300)
+	S.atBottom = false
+	return true
+}
 const pad = (n) => String(n).padStart(2, '0')
 const sameDay = (a, b) => a.toDateString() === b.toDateString()
 function fmtListTime(ts) {
@@ -123,7 +134,24 @@ $('#gate-form').addEventListener('submit', async (e) => {
 const call = (ev, data) => new Promise((res) => socket.emit(ev, data, (r) => res(r || {})))
 
 function connect() {
-	socket = io({ transports: ['websocket', 'polling'] })
+	socket = io({ transports: ['websocket', 'polling'], auth: { account: localGet('acc') || undefined } })
+	socket.on('account', ({ id }) => {
+		if (S.acc && S.acc !== id) resetAccountView()
+		S.acc = id
+		socket.auth.account = id
+		localSet('acc', id)
+	})
+	socket.on('accounts', (list) => {
+		S.accounts = list
+		renderAccounts?.()
+	})
+	socket.on('chat.cleared', (chatId) => {
+		if (chatId !== S.current) return
+		S.messages = []
+		S.msgIds = new Set()
+		$('#msg-list').innerHTML = ''
+	})
+	for (const ev of ['status.new', 'call', 'scheduled.update', 'bot.log']) socket.on(ev, (p) => onFeatureEvent?.(ev, p))
 	socket.on('connect_error', (e) => {
 		if (e.message === 'unauthorized') location.reload()
 	})
@@ -143,6 +171,7 @@ function connect() {
 	})
 	socket.on('message.new', (m) => {
 		if (m.chatId !== S.current) return
+		if (S.hasNewer) return show($('#btn-down')) // открыт фрагмент истории — не склеиваем
 		addMessages([m], 'append')
 	})
 	socket.on('message.update', (m) => {
@@ -169,11 +198,17 @@ function connect() {
 		S.presence[chatId] = { ...(S.presence[chatId] || {}), ...presences }
 		if (chatId === S.current) renderChatHead()
 	})
-	socket.on('reset', () => {
-		S.chats.clear()
-		S.chatsLoaded = false
-		closeChat()
-	})
+	socket.on('reset', resetAccountView)
+}
+function resetAccountView() {
+	S.chats.clear()
+	S.chatsLoaded = false
+	S.presence = {}
+	renderLogin.autostarted = false
+	if (S.current) _closeChat()
+	nav.length = 0
+	if (!$('#drawer').classList.contains('hidden')) _closeDrawer()
+	renderChats()
 }
 
 function onState(st) {
@@ -191,8 +226,9 @@ function onState(st) {
 		show($('#sync-bar'), st.sync != null)
 		$('#sync-bar').textContent = `Синхронизация истории сообщений… ${st.sync ?? 0}%`
 		$('#me-avatar').outerHTML = st.me ? avatarHTML(st.me.id, st.me.name, 'sm').replace('class="avatar sm"', 'class="avatar sm" id="me-avatar" title="' + esc(st.me.name || '') + '"') : '<div id="me-avatar" class="avatar sm"></div>'
-		if ($('#drawer').dataset.kind === 'settings') openSettings()
+		if ($('#drawer').dataset.kind === 'settings') openSettings(true)
 	}
+	renderAccounts?.()
 }
 
 // ============================================================ login
@@ -238,14 +274,14 @@ $('#login-code').addEventListener('submit', async (e) => {
 function renderPrivacy() {
 	const s = S.state.settings || {}
 	$('#privacy-flags').innerHTML =
-		`<span class="flag ${s.online ? '' : 'off'}" data-open-settings>${s.online ? '🟢 В сети' : '👻 Невидимка'}</span>` +
-		`<span class="flag ${s.readReceipts ? '' : 'off'}" data-open-settings>${s.readReceipts ? '✔✔ Прочтение' : '🙈 Без прочтения'}</span>`
+		`<span class="flag ${s.online ? '' : 'off'}" title="${s.online ? 'В сети виден' : 'Невидимка'}">${s.online ? '🟢' : '👻'}<span class="t"> ${s.online ? 'В сети' : 'Невидимка'}</span></span>` +
+		`<span class="flag ${s.readReceipts ? '' : 'off'}" title="${s.readReceipts ? 'Отчёты о прочтении включены' : 'Без отчётов о прочтении'}">${s.readReceipts ? '✔✔' : '🙈'}<span class="t"> ${s.readReceipts ? 'Прочтение' : 'Без прочтения'}</span></span>`
 	$('#empty-privacy').textContent =
 		(s.online ? 'Ваш статус «В сети» виден, пока открыта вкладка.' : 'Статус «В сети» скрыт.') + ' ' +
 		(s.readReceipts ? 'Отчёты о прочтении отправляются.' : 'Отчёты о прочтении не отправляются.')
 	renderChatHead()
 }
-$('#privacy-flags').addEventListener('click', openSettings)
+$('#privacy-flags').addEventListener('click', () => openSettings())
 
 // ============================================================ chats
 async function loadChats() {
@@ -300,7 +336,9 @@ function renderChats() {
 		const top = el.scrollTop
 		// рисуем не больше 400 чатов за раз, остальные — при прокрутке
 		const limit = Math.max(400, renderChats.limit || 0)
-		el.innerHTML = list.length ? list.slice(0, limit).map(chatItemHTML).join('') : `<div class="list-empty">${S.state.sync != null ? 'Загрузка чатов…' : 'Чатов нет'}</div>`
+		const results = typeof searchResultsHTML === 'function' ? searchResultsHTML() : ''
+		el.innerHTML =
+			(list.length ? (results ? '<div class="list-section">Чаты</div>' : '') + list.slice(0, limit).map(chatItemHTML).join('') : results ? '' : `<div class="list-empty">${S.state.sync != null ? 'Загрузка чатов…' : S.query ? 'Ничего не найдено' : 'Чатов нет'}</div>`) + results
 		el.scrollTop = top
 		const unread = [...S.chats.values()].filter((c) => c.unread > 0 && !c.archived && !c.muted).length
 		document.title = unread ? `(${unread}) WA Web` : 'WA Web'
@@ -329,15 +367,12 @@ $('#chat-list').addEventListener('contextmenu', (e) => {
 	chatMenu(item.dataset.chat, e.clientX, e.clientY)
 })
 function chatMenu(id, x, y) {
-	const c = S.chats.get(id)
-	menu(x, y, [
-		['Открыть', () => openChat(id)],
-		c?.unread ? ['Отметить прочитанным', () => markRead(id)] : ['Отметить непрочитанным', () => call('chat.unread', { chatId: id })]
-	])
+	menu(x, y, chatMenuItems(id, true))
 }
 $('#search').addEventListener('input', (e) => {
 	S.query = e.target.value
 	renderChats()
+	searchMessages(S.query)
 })
 document.querySelectorAll('.chip').forEach((b) =>
 	b.addEventListener('click', () => {
@@ -346,26 +381,22 @@ document.querySelectorAll('.chip').forEach((b) =>
 		renderChats()
 	})
 )
-$('#btn-new').addEventListener('click', () => {
-	modal(`<h3>Новый чат</h3><input class="field" id="new-phone" type="tel" placeholder="Номер, например +7 777 123 45 67">
-		<div class="actions"><button class="btn" data-close>Отмена</button><button class="btn primary" id="new-go">Открыть</button></div>`)
-	$('#new-phone').focus()
-	const go = () => {
-		const d = $('#new-phone').value.replace(/\D/g, '')
-		if (d.length < 8) return toast('Введите номер полностью')
-		const id = d + '@s.whatsapp.net'
-		if (!S.chats.has(id)) S.chats.set(id, { id, name: '+' + d, phone: '+' + d, unread: 0, ts: Math.floor(Date.now() / 1000) })
-		closeModal()
-		openChat(id)
-	}
-	$('#new-go').onclick = go
-	$('#new-phone').onkeydown = (e) => e.key === 'Enter' && go()
+$('#btn-new').addEventListener('click', (e) => {
+	const r = e.currentTarget.getBoundingClientRect()
+	menu(r.left - 120, r.bottom, [
+		['Новый чат', newChatModal],
+		['Новая группа', newGroupModal],
+		['Вступить по ссылке', joinGroupModal]
+	])
 })
 
 // ============================================================ open chat
-async function openChat(id) {
-	if (S.current === id) return
+async function openChat(id, jumpTo) {
+	if (S.current === id && !jumpTo) return
+	if ($('#drawer').dataset.kind && isNarrow()) closeDrawer()
+	if (S.current === id && jumpTo && jumpToMessage(jumpTo)) return
 	S.current = id
+	S.hasNewer = false
 	S.messages = []
 	S.msgIds = new Set()
 	S.noMoreLocal = false
@@ -382,9 +413,12 @@ async function openChat(id) {
 	renderChats()
 	renderChatHead()
 	reportClient()
-	const r = await call('messages.list', { chatId: id, limit: 50 })
+	const r = jumpTo ? await call('messages.around', { chatId: id, id: jumpTo }) : await call('messages.list', { chatId: id, limit: 50 })
 	if (S.current !== id) return
+	if (r.error) toast(r.error)
+	S.hasNewer = !!r.hasNewer
 	addMessages(r.messages || [], 'replace')
+	if (jumpTo) setTimeout(() => jumpToMessage(jumpTo), 50)
 	S.noMoreLocal = !r.hasMore
 	if (r.requested && !r.hasMore) {
 		S.waitingHistory = true
@@ -452,17 +486,13 @@ function renderChatHead() {
 	show($('#btn-mark-read'), readOff && c.unread > 0)
 	$('#btn-mark-read').textContent = `Прочитать (${c.unread > 0 ? c.unread : ''})`.replace(' ()', '')
 }
-$('#chat-title-wrap').addEventListener('click', openInfo)
+$('#chat-title-wrap').addEventListener('click', () => openInfo())
 $('#btn-mark-read').addEventListener('click', () => markRead(S.current))
 $('#btn-chat-menu').addEventListener('click', (e) => {
 	const r = e.currentTarget.getBoundingClientRect()
 	const id = S.current
 	const c = S.chats.get(id)
-	menu(r.left - 150, r.bottom, [
-		['Информация', openInfo],
-		c?.unread ? ['Отметить прочитанным', () => markRead(id)] : ['Отметить непрочитанным', () => call('chat.unread', { chatId: id })],
-		['Закрыть чат', closeChat]
-	])
+	menu(r.left - 150, r.bottom, [['Информация', () => openInfo()], ...chatMenuItems(id, false), ['Закрыть чат', closeChat]])
 })
 async function markRead(id) {
 	const r = await call('chat.read', { chatId: id })
@@ -477,14 +507,15 @@ function messageHTML(m, prev) {
 	if (m.type === 'system') return html + `<div class="sys" data-mid="${esc(m.id)}">${m.senderName && !m.fromMe ? esc(m.senderName) + ' ' : ''}${esc(m.text)}</div>`
 	const first = !prev || prev.fromMe !== m.fromMe || prev.sender !== m.sender || prev.type === 'system' || !sameDay(new Date(prev.ts * 1000), new Date(m.ts * 1000))
 	const isGroup = m.chatId.endsWith('@g.us')
-	const metaHTML = `<span class="meta">${m.edited ? 'изм. ' : ''}${fmtTime(m.ts)}${m.fromMe ? ticks(m.status) : ''}</span>`
+	const metaHTML = `<span class="meta">${m.starred ? '★ ' : ''}${m.edited ? `<span class="${m.edits?.length ? 'edited-link' : ''}" data-edits="${esc(m.id)}">изм.</span> ` : ''}${fmtTime(m.ts)}${m.fromMe ? ticks(m.status) : ''}</span>`
 	let body = ''
 	let cls = ''
-	const src = `/media/${enc(m.chatId)}/${enc(m.id)}`
+	const src = mediaUrl(m)
 	const thumb = m.media?.thumb ? `data:image/jpeg;base64,${m.media.thumb}` : ''
 
-	if (m.deleted) body = `<div class="text deleted">🚫 ${m.fromMe ? 'Вы удалили это сообщение' : 'Сообщение удалено'}</div>`
+	if (m.deleted && !m.kept) body = `<div class="text deleted">🚫 ${m.fromMe ? 'Вы удалили это сообщение' : 'Сообщение удалено'}</div>`
 	else {
+		if (m.kept) body += `<div class="kept-label">🗑 ${m.fromMe ? 'Вы удалили у всех' : 'Удалено отправителем'} · сохранено здесь</div>`
 		if (m.forwarded) body += '<div class="fwd">↪ Пересланное сообщение</div>'
 		if (m.quoted) {
 			body += `<div class="quote" data-jump="${esc(m.quoted.id)}">${m.quoted.thumb ? '' : ''}<div class="q-body"><div class="q-name">${esc(m.quoted.senderName || (m.quoted.sender ? '' : ''))}</div><div class="q-text">${esc(m.quoted.text)}</div></div>${m.quoted.thumb ? `<img src="data:image/jpeg;base64,${m.quoted.thumb}" alt="">` : ''}</div>`
@@ -527,6 +558,7 @@ function messageHTML(m, prev) {
 		}
 		if (m.text) body += `<div class="text">${formatText(m.text)}${m.viewOnce ? ' <span class="muted">(однократный просмотр)</span>' : ''}</div>`
 	}
+	if (m.kept) cls += ' kept'
 	const mediaOnly = !m.deleted && !m.text && !m.quoted && !m.forwarded && ['image', 'video'].includes(m.type)
 	if (mediaOnly) cls += ' media-only'
 	const sender = isGroup && !m.fromMe && first && m.type !== 'sticker' ? `<div class="sender" style="color:${colorFor(m.sender)}">${esc(m.senderName)}</div>` : ''
@@ -553,7 +585,7 @@ function scrollBottom() {
 // картинки догружаются и меняют высоту — держим ленту внизу
 $('#msg-list').addEventListener('load', () => S.atBottom && scrollBottom(), true)
 
-function addMessages(list, mode) {
+function addMessages(list, mode, opts = {}) {
 	const fresh = list.filter((m) => m && !S.msgIds.has(m.id))
 	fresh.forEach((m) => S.msgIds.add(m.id))
 	const el = $('#messages')
@@ -575,7 +607,7 @@ function addMessages(list, mode) {
 		return
 	}
 	// append
-	const stick = nearBottom() || fresh.some((m) => m.fromMe)
+	const stick = !opts.noStick && (nearBottom() || fresh.some((m) => m.fromMe))
 	for (const m of fresh.sort((a, b) => a.ts - b.ts)) {
 		const prev = S.messages[S.messages.length - 1]
 		S.messages.push(m)
@@ -616,9 +648,27 @@ $('#messages').addEventListener('scroll', () => {
 	const el = $('#messages')
 	S.atBottom = nearBottom()
 	if (el.scrollTop < 300) loadOlder()
+	if (S.hasNewer && el.scrollHeight - el.scrollTop - el.clientHeight < 300) loadNewer()
 	if (nearBottom()) show($('#btn-down'), false)
 })
+async function loadNewer() {
+	if (S.loadingNewer || !S.hasNewer || !S.current) return
+	const id = S.current
+	S.loadingNewer = true
+	const after = S.messages[S.messages.length - 1]?.ts
+	const r = await call('messages.list', { chatId: id, after, limit: 50 })
+	S.loadingNewer = false
+	if (S.current !== id) return
+	S.hasNewer = !!r.hasNewer && (r.messages || []).some((m) => !S.msgIds.has(m.id))
+	addMessages(r.messages || [], 'append', { noStick: true })
+}
 $('#btn-down').addEventListener('click', () => {
+	if (S.hasNewer) {
+		// открыт фрагмент истории — загружаем конец переписки
+		const id = S.current
+		S.current = null
+		return openChat(id)
+	}
 	scrollBottom()
 	show($('#btn-down'), false)
 })
@@ -627,6 +677,8 @@ $('#btn-down').addEventListener('click', () => {
 $('#msg-list').addEventListener('click', (e) => {
 	const view = e.target.closest('[data-view]')
 	if (view) return openLightbox(view.dataset.view, view.dataset.src)
+	const ed = e.target.closest('.edited-link')
+	if (ed) return editsModal(S.messages.find((x) => x.id === ed.dataset.edits))
 	const jump = e.target.closest('[data-jump]')
 	if (jump) {
 		const el = document.querySelector(`[data-mid="${CSS.escape(jump.dataset.jump)}"]`)
@@ -730,8 +782,13 @@ function messageMenu(id, x, y) {
 	if (!m) return
 	const items = [['Ответить', () => setReply(m)]]
 	if (m.text) items.push(['Копировать текст', () => navigator.clipboard?.writeText(m.text).then(() => toast('Скопировано'))])
-	if (m.media) items.push(['Скачать', () => window.open(`/media/${enc(m.chatId)}/${enc(m.id)}?download=1`)])
+	if (m.media) items.push(['Скачать', () => window.open(mediaUrl(m) + '?download=1')])
 	if (m.reactions?.some((r) => r.fromMe)) items.push(['Убрать реакцию', () => react(m, '')])
+	if (!m.deleted) items.push(['Переслать', () => forwardModal(m)])
+	if (m.fromMe && !m.deleted && m.type === 'text' && Date.now() / 1000 - m.ts < 15 * 60) items.push(['Изменить', () => editModal(m)])
+	items.push([m.starred ? 'Убрать из избранного' : 'В избранное', () => call('message.star', { chatId: m.chatId, msgId: m.id, star: !m.starred }).then((r) => r.error && toast(r.error))])
+	if (m.edits?.length) items.push(['История правок', () => editsModal(m)])
+	items.push(['Удалить у себя', () => confirmModal('Удалить сообщение только у себя?', () => call('message.deleteForMe', { chatId: m.chatId, msgId: m.id }).then((r) => r.error && toast(r.error)))])
 	if (m.fromMe && !m.deleted) items.push(['Удалить у всех', () => confirmModal('Удалить сообщение у всех?', () => call('message.delete', { chatId: m.chatId, msgId: m.id }).then((r) => r.error && toast(r.error)))])
 	menu(x, y, items, QUICK.map((q) => [q, () => react(m, q)]))
 }
@@ -810,7 +867,13 @@ $('#emoji-pop').addEventListener('click', (e) => {
 })
 
 // вложения
-$('#btn-attach').addEventListener('click', () => $('#file-input').click())
+$('#btn-attach').addEventListener('click', (e) => {
+	const r = e.currentTarget.getBoundingClientRect()
+	menu(r.left, r.top - 110, [
+		['📎 Фото, видео, файл', () => $('#file-input').click()],
+		['⏰ Отложенное сообщение', () => scheduleModal(S.current, input.value)]
+	])
+})
 $('#file-input').addEventListener('change', (e) => {
 	const files = [...e.target.files]
 	e.target.value = ''
@@ -922,73 +985,11 @@ function _closeDrawer() {
 	show($('#drawer'), false)
 }
 $('#drawer-close').addEventListener('click', closeDrawer)
-$('#btn-settings').addEventListener('click', openSettings)
-
-function openSettings() {
-	const s = S.state.settings || {}
-	const me = S.state.me || {}
-	openDrawer(
-		'settings',
-		'Настройки',
-		`<div class="profile-head">${avatarHTML(me.id || 'me', me.name, 'xl')}<h2>${esc(me.name || '')}</h2><div class="muted">${me.id ? '+' + esc(me.id.split('@')[0]) : ''}</div></div>
-		<div class="section-title">Приватность</div>
-		<label class="setting">
-			<div class="s-text"><div class="s-title">Показывать «В сети»</div>
-			<div class="s-desc">Если выключено, этот клиент никогда не сообщает WhatsApp, что вы онлайн, и не показывает «печатает…». Собеседники не увидят «в сети» из-за этой вкладки. Учтите: открытое приложение на телефоне по-прежнему показывает вас в сети.</div></div>
-			<span class="switch"><input type="checkbox" id="set-online" ${s.online ? 'checked' : ''}><span></span></span>
-		</label>
-		<label class="setting">
-			<div class="s-text"><div class="s-title">Отправлять отчёты о прочтении</div>
-			<div class="s-desc">Если выключено, открытие чата не ставит собеседнику синие галочки, а голосовые не отмечаются прослушанными. Чат остаётся непрочитанным и на телефоне. Отметить прочитанным можно вручную кнопкой в шапке чата.</div></div>
-			<span class="switch"><input type="checkbox" id="set-read" ${s.readReceipts ? 'checked' : ''}><span></span></span>
-		</label>
-		<div class="section-title">Оформление</div>
-		<div class="setting"><div class="s-text"><div class="s-title">Тема</div></div>
-			<select id="set-theme" class="field" style="width:auto">
-				<option value="">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option>
-			</select></div>
-		<div style="margin-top:24px"><button class="btn danger" id="btn-logout">Выйти из WhatsApp</button></div>`
-	)
-	$('#set-online').onchange = (e) => saveSettings({ online: e.target.checked })
-	$('#set-read').onchange = (e) => saveSettings({ readReceipts: e.target.checked })
-	$('#set-theme').value = localGet('theme') || ''
-	$('#set-theme').onchange = (e) => {
-		localSet('theme', e.target.value)
-		applyTheme()
-	}
-	$('#btn-logout').onclick = () => confirmModal('Выйти из аккаунта? Устройство будет отвязано, локальная история удалена.', async () => {
-		await call('logout')
-		closeDrawer()
-	})
-}
-async function saveSettings(patch) {
-	const r = await call('settings.set', patch)
-	if (r.error) toast(r.error)
-}
-
-async function openInfo() {
-	const id = S.current
-	const c = S.chats.get(id) || { id, name: id }
-	if (!c.isGroup) {
-		openDrawer('info', 'Данные контакта', `<div class="profile-head">${avatarHTML(c.id, c.name, 'xl')}<h2>${esc(c.name)}</h2><div class="muted">${esc(c.phone || id)}</div></div>`)
-		return
-	}
-	openDrawer('info', 'Данные группы', `<div class="profile-head">${avatarHTML(c.id, c.name, 'xl')}<h2>${esc(c.name)}</h2></div><div class="spinner" style="margin:20px auto"></div>`)
-	const r = await call('group.info', { chatId: id })
-	const g = r.group
-	if (!g || S.current !== id || $('#drawer').dataset.kind !== 'info') return
-	S.group = g
-	$('#drawer-body').innerHTML = `<div class="profile-head">${avatarHTML(c.id, c.name, 'xl')}<h2>${esc(g.subject || c.name)}</h2><div class="muted">Группа · ${g.participants.length} участник(ов)</div></div>
-		${g.desc ? `<div class="section-title">Описание</div><div style="white-space:pre-wrap">${formatText(g.desc)}</div>` : ''}
-		<div class="section-title">Участники</div>
-		${g.participants
-			.sort((a, b) => !!b.admin - !!a.admin)
-			.map((p) => `<div class="member">${avatarHTML(p.id, p.name, 'sm')}<div style="flex:1;min-width:0">${esc(p.name)}<div class="muted" style="font-size:12px">${p.id.endsWith('@s.whatsapp.net') ? '+' + esc(p.id.split('@')[0]) : ''}</div></div>${p.admin ? '<span class="admin">админ</span>' : ''}</div>`)
-			.join('')}`
-}
 
 // ============================================================ overlays
+let menuOpenedAt = 0
 function menu(x, y, items, quick) {
+	menuOpenedAt = performance.now()
 	const m = $('#ctx-menu')
 	m.innerHTML = (quick ? `<div class="quick">${quick.map(([t], i) => `<button data-q="${i}">${t}</button>`).join('')}</div>` : '') + items.map(([t], i) => `<button data-i="${i}">${esc(t)}</button>`).join('')
 	show(m)
@@ -1006,6 +1007,8 @@ function menu(x, y, items, quick) {
 }
 document.addEventListener('click', (e) => {
 	if (Date.now() - lastLongPress < 700) return
+	// тот же клик, что открыл меню, не должен его закрыть
+	if (performance.now() - menuOpenedAt < 80) return
 	if (!e.target.closest('#ctx-menu') && !e.target.closest('[data-more]')) show($('#ctx-menu'), false)
 	if (!e.target.closest('#emoji-pop')) show($('#emoji-pop'), false)
 })
@@ -1048,6 +1051,8 @@ function openLightbox(kind, src) {
 }
 const closeLightbox = () => navClose('lightbox')
 function _closeLightbox() {
+	clearTimeout(S.svTimer)
+	$('#lightbox').classList.remove('status-mode')
 	$('#lightbox').innerHTML = ''
 	show($('#lightbox'), false)
 }
@@ -1083,5 +1088,4 @@ function applyTheme() {
 applyTheme()
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {})
-
-boot()
+// boot() вызывается в конце features.js

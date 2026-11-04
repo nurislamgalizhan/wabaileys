@@ -21,10 +21,33 @@ import makeWASocket, {
 	WAMessageStubType
 } from 'baileys'
 import QRCode from 'qrcode'
-import { Store } from './db.js'
-import { msgTimestamp, previewText, serializeContent, unwrap } from './serialize.js'
+import { Store, STATUS_JID } from './db.js'
+import { msgTimestamp, previewText, searchText, serializeContent, unwrap } from './serialize.js'
 
-const DEFAULT_SETTINGS = { online: false, readReceipts: false, deviceName: '' }
+export const DEFAULT_SETTINGS = {
+	online: false, // показывать «В сети»
+	readReceipts: false, // синие галочки
+	statusReceipts: false, // отмечать статусы просмотренными
+	keepDeleted: true, // сохранять содержимое удалённых сообщений
+	deviceName: '',
+	rejectCalls: false,
+	rejectMessage: '',
+	botEnabled: false,
+	aiModel: 'claude-opus-5-5',
+	webhookUrl: ''
+}
+const BOOL_SETTINGS = ['online', 'readReceipts', 'statusReceipts', 'keepDeleted', 'rejectCalls', 'botEnabled']
+const STR_SETTINGS = { rejectMessage: 1000, aiModel: 80, webhookUrl: 500 }
+const PRIVACY_SETTERS = {
+	last: 'updateLastSeenPrivacy',
+	online: 'updateOnlinePrivacy',
+	profile: 'updateProfilePicturePrivacy',
+	status: 'updateStatusPrivacy',
+	readreceipts: 'updateReadReceiptsPrivacy',
+	groupadd: 'updateGroupsAddPrivacy',
+	calladd: 'updateCallPrivacy',
+	messages: 'updateMessagesPrivacy'
+}
 
 // Как устройство будет выглядеть в «Связанных устройствах» телефона.
 // Название = browser[0]. Полную историю WhatsApp гарантированно отдаёт «десктопу» Mac OS / Windows.
@@ -61,6 +84,26 @@ export class WhatsApp extends EventEmitter {
 		this.pnToLid = new Map([...this.store.lidToPn].map(([l, p]) => [p, l]))
 		this.pendingChats = new Set()
 		this.flushTimer = null
+		this.buildSearchIndex()
+	}
+
+	// первичное построение полнотекстового индекса для уже сохранённых сообщений
+	buildSearchIndex() {
+		if (this.store.get('fts_v2')) return
+		let n = 0
+		this.store.tx(() => {
+			this.store.clearSearchIndex()
+			for (const [chatId, msg] of this.store.allMessages()) {
+				this.store.putMessage(chatId, msg, msgTimestamp(msg), searchText(msg))
+				n++
+			}
+			this.store.set('fts_v2', true)
+		})
+		if (n) this.logger.info({ messages: n }, 'search index built')
+	}
+	close() {
+		this.stop()
+		this.store.close()
 	}
 
 	// ---------------------------------------------------------------- state
@@ -69,7 +112,7 @@ export class WhatsApp extends EventEmitter {
 		this.emit('state', this.publicState())
 	}
 	publicState() {
-		return { ...this.state, settings: this.settings }
+		return { ...this.state, settings: this.settings, hasAiKey: !!(this.store.get('secret.aiKey') || process.env.ANTHROPIC_API_KEY) }
 	}
 	isRegistered() {
 		try {
@@ -160,6 +203,9 @@ export class WhatsApp extends EventEmitter {
 		const isGroup = !!isJidGroup(chatId)
 		const sender = msg.key.fromMe ? this.meIds()[0] : this.norm(msg.key.participant || msg.key.remoteJid, msg.key.participantAlt)
 		if (msg._edited) d.edited = true
+		if (msg._edits?.length) d.edits = msg._edits
+		if (msg._starred) d.starred = true
+		if (msg._revoked) d.deletedAt = msg._revoked.at
 		return {
 			...d,
 			id: msg.key.id,
@@ -191,7 +237,11 @@ export class WhatsApp extends EventEmitter {
 	listChats() {
 		return this.store.allChats().map((r) => this.chatDTO(r))
 	}
-	listMessages(chatId, before, limit = 50) {
+	listMessages(chatId, before, limit = 50, after) {
+		if (after != null) {
+			const msgs = this.store.pageAfter(chatId, after, limit)
+			return { messages: msgs.map((m) => this.messageDTO(chatId, m)).filter(Boolean), hasNewer: msgs.length === limit }
+		}
 		const msgs = this.store.pageMessages(chatId, before || Number.MAX_SAFE_INTEGER, limit)
 		let requested = false
 		if (msgs.length < limit) requested = this.requestOlder(chatId)
@@ -225,8 +275,13 @@ export class WhatsApp extends EventEmitter {
 		if (typeof chat.archived === 'boolean') patch.archived = chat.archived ? 1 : 0
 		if ('pinned' in chat) patch.pinned = chat.pinned ? toNumber(chat.pinned) || 1 : 0
 		if ('pin' in chat) patch.pinned = chat.pin ? toNumber(chat.pin) || 1 : 0
-		if ('muteEndTime' in chat) patch.muted = chat.muteEndTime ? toNumber(chat.muteEndTime) : 0
-		if ('mute' in chat) patch.muted = chat.mute ? toNumber(chat.mute) : 0
+		// время окончания «без звука»: WhatsApp присылает то секунды, то миллисекунды; -1 = навсегда
+		const muteSec = (v) => {
+			const n = v ? toNumber(v) : 0
+			return n > 1e11 ? Math.floor(n / 1000) : n
+		}
+		if ('muteEndTime' in chat) patch.muted = muteSec(chat.muteEndTime)
+		if ('mute' in chat) patch.muted = muteSec(chat.mute)
 		this.store.upsertChat(patch)
 		this.queueChat(id)
 	}
@@ -260,7 +315,8 @@ export class WhatsApp extends EventEmitter {
 	saveMessage(msg, { live = false } = {}) {
 		const key = msg.key
 		if (!key?.remoteJid || !key.id) return null
-		if (isJidStatusBroadcast(key.remoteJid) || isJidNewsletter(key.remoteJid) || key.remoteJid.endsWith('@broadcast')) return null
+		if (isJidStatusBroadcast(key.remoteJid)) return this.saveStatus(msg)
+		if (isJidNewsletter(key.remoteJid) || key.remoteJid.endsWith('@broadcast')) return null
 		const chatId = this.norm(key.remoteJid, key.remoteJidAlt)
 		if (key.participant && key.participantAlt) this.norm(key.participant, key.participantAlt)
 		const sender = key.fromMe ? null : this.norm(key.participant || key.remoteJid, key.participantAlt)
@@ -291,10 +347,11 @@ export class WhatsApp extends EventEmitter {
 				msg.message = existing.message
 				msg._edited = true
 			}
-			if (existing._readSent) msg._readSent = true
+			for (const k of ['_readSent', '_starred', '_edits', '_revoked']) if (existing[k] && !msg[k]) msg[k] = existing[k]
+			if (existing._revoked && existing.message) msg.message = existing.message
 		}
 		const ts = msgTimestamp(msg)
-		this.store.putMessage(chatId, msg, ts)
+		this.store.putMessage(chatId, msg, ts, searchText(msg))
 
 		const chat = this.store.getChat(chatId)
 		const patch = { id: chatId, ts: Math.max(chat?.ts || 0, ts) }
@@ -503,9 +560,17 @@ export class WhatsApp extends EventEmitter {
 				// реакции в реальном времени приходят отдельным событием messages.reaction
 				const r = this.saveMessage(m, { live })
 				if (!r) continue
+				if (r.chatId === STATUS_JID) {
+					if (r.isNew) this.emit('status.new', this.messageDTO(STATUS_JID, r.msg))
+					continue
+				}
 				const dto = this.messageDTO(r.chatId, r.msg)
 				if (dto) this.emit(r.isNew ? 'message.new' : 'message.update', dto)
-				if (r.isNew && !m.key.fromMe && type === 'notify') this.autoRead(r.chatId)
+				if (r.isNew && type === 'notify' && dto) {
+					// для автоответчика, вебхуков
+					this.emit('incoming', { dto, msg: r.msg, chat: this.store.getChat(r.chatId) })
+					if (!m.key.fromMe) this.autoRead(r.chatId)
+				}
 			}
 		})
 
@@ -515,15 +580,23 @@ export class WhatsApp extends EventEmitter {
 				const msg = this.store.getMessage(chatId, key.id)
 				if (!msg) continue
 				if (update.message === null || update.messageStubType === WAMessageStubType.REVOKE) {
-					msg.message = null
-					msg.messageStubType = WAMessageStubType.REVOKE
+					if (this.settings.keepDeleted && msg.message && !msg._revoked) {
+						// «антиудаление»: сохраняем содержимое, помечаем как удалённое
+						msg._revoked = { at: Math.floor(Date.now() / 1000) }
+					} else if (!msg._revoked) {
+						msg.message = null
+						msg.messageStubType = WAMessageStubType.REVOKE
+					}
 				} else if (update.message?.editedMessage?.message) {
+					// история правок: запоминаем прежний текст
+					const before = previewText(msg)
+					msg._edits = [...(msg._edits || []), { text: before, ts: Math.floor(Date.now() / 1000) }].slice(-20)
 					msg.message = update.message.editedMessage.message
 					msg._edited = true
 				}
 				if (update.status != null) msg.status = Math.max(msg.status || 0, update.status)
-				if (update.starred != null) msg.starred = update.starred
-				this.store.putMessage(chatId, msg, msgTimestamp(msg))
+				if (update.starred != null) msg._starred = !!update.starred
+				this.store.putMessage(chatId, msg, msgTimestamp(msg), searchText(msg))
 				const dto = this.messageDTO(chatId, msg)
 				if (dto) this.emit('message.update', dto)
 				this.queueChat(chatId)
@@ -576,6 +649,10 @@ export class WhatsApp extends EventEmitter {
 			}
 		})
 
+		ev.on('call', (calls) => {
+			for (const c of calls) this.onCall(c).catch((err) => this.logger.warn({ err }, 'call handling failed'))
+		})
+
 		ev.on('presence.update', ({ id, presences }) => {
 			const chatId = this.norm(id)
 			const out = {}
@@ -609,7 +686,9 @@ export class WhatsApp extends EventEmitter {
 		}
 	}
 	updateSettings(patch) {
-		for (const k of ['online', 'readReceipts']) if (typeof patch[k] === 'boolean') this.settings[k] = patch[k]
+		for (const k of BOOL_SETTINGS) if (typeof patch[k] === 'boolean') this.settings[k] = patch[k]
+		for (const [k, max] of Object.entries(STR_SETTINGS)) if (typeof patch[k] === 'string') this.settings[k] = patch[k].trim().slice(0, max)
+		if (typeof patch.aiKey === 'string') this.store.set('secret.aiKey', patch.aiKey.trim())
 		if (typeof patch.deviceName === 'string' && patch.deviceName.trim() !== this.settings.deviceName) {
 			this.settings.deviceName = patch.deviceName.trim().slice(0, 40)
 			// имя передаётся при привязке: если вход ещё не выполнен — пересоздаём сокет с новым именем
@@ -759,6 +838,320 @@ export class WhatsApp extends EventEmitter {
 			})
 		}
 	}
+	// ================================================================ статусы (истории)
+	saveStatus(msg) {
+		const key = msg.key
+		if (!serializeContent(msg)) return null
+		const existing = this.store.getMessage(STATUS_JID, key.id)
+		if (existing?._seen) msg._seen = true
+		if (existing?._readSent) msg._readSent = true
+		const sender = key.fromMe ? this.meIds()[0] : this.norm(key.participant, key.participantAlt)
+		if (sender && msg.pushName) this.store.upsertContact({ id: sender, notify: msg.pushName })
+		this.store.putMessage(STATUS_JID, msg, msgTimestamp(msg))
+		return { chatId: STATUS_JID, msg, isNew: !existing }
+	}
+	listStatuses() {
+		const since = Math.floor(Date.now() / 1000) - 24 * 3600
+		this.store.deleteOlder(STATUS_JID, since - 24 * 3600) // храним не дольше двух суток
+		const groups = new Map()
+		for (const m of this.store.messagesSince(STATUS_JID, since)) {
+			const dto = this.messageDTO(STATUS_JID, m)
+			if (!dto) continue
+			dto.seen = !!m._seen
+			const sender = dto.fromMe ? 'me' : dto.sender
+			if (!groups.has(sender)) groups.set(sender, { sender, jid: dto.sender, name: dto.fromMe ? 'Мой статус' : this.nameOf(dto.sender, m.pushName), items: [] })
+			groups.get(sender).items.push(dto)
+		}
+		return [...groups.values()]
+			.map((g) => ({ ...g, ts: g.items[g.items.length - 1].ts, unseen: g.items.filter((i) => !i.seen && !i.fromMe).length }))
+			.sort((a, b) => (a.sender === 'me' ? -1 : b.sender === 'me' ? 1 : (b.unseen > 0) - (a.unseen > 0) || b.ts - a.ts))
+	}
+	// просмотр статуса: локально всегда, а отчёт автору — только если разрешено
+	async viewStatus(id) {
+		const m = this.store.getMessage(STATUS_JID, id)
+		if (!m) return
+		m._seen = true
+		if (this.settings.statusReceipts && !m.key.fromMe && !m._readSent && this.sock && this.state.connection === 'open') {
+			await this.sock.readMessages([m.key])
+			m._readSent = true
+		}
+		this.store.putMessage(STATUS_JID, m, msgTimestamp(m))
+	}
+
+	// ================================================================ звонки
+	async onCall(c) {
+		const from = this.norm(c.from, c.callerPn)
+		const call = { id: c.id, from, name: this.nameOf(from), isVideo: !!c.isVideo, isGroup: !!c.isGroup, status: c.status, ts: Math.floor(new Date(c.date || Date.now()).getTime() / 1000) }
+		const prev = this.store.calls().find((x) => x.id === c.id)
+		if (c.status === 'offer' && !c.offline && this.settings.rejectCalls && this.sock) {
+			await this.sock.rejectCall(c.id, c.from)
+			call.rejected = true
+			if (this.settings.rejectMessage) await this.sock.sendMessage(from, { text: this.settings.rejectMessage }).catch(() => {})
+		}
+		const merged = { ...prev, ...call, rejected: call.rejected || prev?.rejected }
+		this.store.saveCall(merged)
+		this.emit('call', merged)
+	}
+	listCalls() {
+		return this.store.calls()
+	}
+
+	// ================================================================ поиск
+	search(query) {
+		return this.store.search(query).map((r) => {
+			const chat = this.store.getChat(r.chat_id)
+			return {
+				chatId: r.chat_id,
+				id: r.msg_id,
+				ts: r.ts,
+				chatName: chat ? this.chatDTO(chat).name : this.nameOf(r.chat_id),
+				snippet: r.snip
+			}
+		})
+	}
+	// окно сообщений вокруг найденного
+	messagesAround(chatId, id) {
+		const target = this.store.getMessage(chatId, id)
+		if (!target) throw new Error('Сообщение не найдено')
+		const ts = msgTimestamp(target)
+		const before = this.store.pageMessages(chatId, ts, 30)
+		const after = this.store.pageAfter(chatId, ts, 30)
+		const seen = new Set()
+		const all = [...before, ...after].filter((m) => !seen.has(m.key.id) && seen.add(m.key.id))
+		return { messages: all.map((m) => this.messageDTO(chatId, m)).filter(Boolean), hasNewer: after.length === 30, hasMore: before.length === 30 }
+	}
+
+	// ================================================================ действия с сообщениями
+	getMsgOrThrow(chatId, msgId) {
+		const m = this.store.getMessage(chatId, msgId)
+		if (!m) throw new Error('Сообщение не найдено')
+		return m
+	}
+	async editMessage(chatId, msgId, text) {
+		const sock = this.requireSock()
+		const m = this.getMsgOrThrow(chatId, msgId)
+		if (!m.key.fromMe) throw new Error('Можно изменять только свои сообщения')
+		if (Date.now() / 1000 - msgTimestamp(m) > 15 * 60) throw new Error('WhatsApp разрешает изменять сообщение только 15 минут')
+		await sock.sendMessage(chatId, { text, edit: m.key })
+	}
+	async forwardMessage(chatId, msgId, toChatIds) {
+		const sock = this.requireSock()
+		const m = this.getMsgOrThrow(chatId, msgId)
+		for (const to of toChatIds) await sock.sendMessage(to, { forward: m })
+	}
+	async starMessage(chatId, msgId, star) {
+		const m = this.getMsgOrThrow(chatId, msgId)
+		if (this.sock && this.state.connection === 'open') await this.sock.star(chatId, [{ id: m.key.id, fromMe: !!m.key.fromMe }], !!star).catch(() => {})
+		m._starred = !!star
+		this.store.putMessage(chatId, m, msgTimestamp(m))
+		this.emit('message.update', this.messageDTO(chatId, m))
+	}
+	listStarred() {
+		const out = []
+		for (const [chatId, m] of this.store.allMessages()) if (m._starred) out.push(this.messageDTO(chatId, m))
+		return out.filter(Boolean).sort((a, b) => b.ts - a.ts)
+	}
+	async deleteForMe(chatId, msgId) {
+		const m = this.getMsgOrThrow(chatId, msgId)
+		if (this.sock && this.state.connection === 'open') {
+			await this.sock.chatModify({ deleteForMe: { deleteMedia: true, key: m.key, timestamp: msgTimestamp(m) } }, chatId).catch(() => {})
+		}
+		this.store.deleteMessage(chatId, msgId)
+		this.emit('message.delete', { chatId, id: msgId })
+		this.queueChat(chatId)
+	}
+
+	// ================================================================ действия с чатами
+	lastMessages(chatId) {
+		const last = this.store.lastMessage(chatId)
+		return last ? [{ key: last.key, messageTimestamp: last.messageTimestamp }] : []
+	}
+	async chatAction(chatId, action, value) {
+		const sock = this.requireSock()
+		const lastMessages = this.lastMessages(chatId)
+		switch (action) {
+			case 'archive':
+				await sock.chatModify({ archive: !!value, lastMessages }, chatId)
+				this.store.upsertChat({ id: chatId, archived: value ? 1 : 0 })
+				break
+			case 'pin':
+				await sock.chatModify({ pin: !!value }, chatId)
+				this.store.upsertChat({ id: chatId, pinned: value ? Math.floor(Date.now() / 1000) : 0 })
+				break
+			case 'mute': {
+				// value — длительность в секундах, -1 = навсегда, 0 = включить звук
+				const until = value === -1 ? -1 : value ? Math.floor(Date.now() / 1000) + value : 0
+				await sock.chatModify({ mute: value ? (value === -1 ? -1 : until * 1000) : null }, chatId)
+				this.store.upsertChat({ id: chatId, muted: until })
+				break
+			}
+			case 'clear':
+				await sock.chatModify({ clear: true, lastMessages }, chatId).catch(() => {})
+				this.store.tx(() => {
+					for (const m of this.store.pageMessages(chatId, Number.MAX_SAFE_INTEGER, 1e9)) this.store.deleteMessage(chatId, m.key.id)
+				})
+				this.emit('chat.cleared', chatId)
+				break
+			case 'delete':
+				await sock.chatModify({ delete: true, lastMessages }, chatId).catch(() => {})
+				this.store.deleteChat(chatId)
+				this.emit('chat.removed', chatId)
+				return
+			case 'block':
+			case 'unblock':
+				await sock.updateBlockStatus(chatId, action)
+				this.blocklist = null
+				break
+			default:
+				throw new Error('Неизвестное действие')
+		}
+		this.queueChat(chatId)
+	}
+	async getBlocklist() {
+		if (!this.blocklist && this.sock) this.blocklist = await this.sock.fetchBlocklist().catch(() => [])
+		return (this.blocklist || []).map((j) => this.norm(j))
+	}
+	async contactInfo(jid) {
+		const out = { id: jid, name: this.nameOf(jid), phone: isPnUser(jid) ? '+' + jid.split('@')[0] : undefined }
+		if (this.sock && this.state.connection === 'open') {
+			const [st] = (await this.sock.fetchStatus(jid).catch(() => null)) || []
+			if (st?.status?.status) out.about = st.status.status
+			out.blocked = (await this.getBlocklist()).includes(jid)
+			const biz = await this.sock.getBusinessProfile(jid).catch(() => null)
+			if (biz) out.business = { description: biz.description, website: biz.website?.[0], email: biz.email, address: biz.address, category: biz.category }
+		}
+		return out
+	}
+	listContacts() {
+		const map = new Map()
+		for (const c of this.store.allContacts()) map.set(c.id, { id: c.id, name: c.name || c.notify || c.verified, saved: !!c.name })
+		for (const r of this.store.allChats()) if (!map.has(r.id)) map.set(r.id, { id: r.id, name: this.chatDTO(r).name, isGroup: !!isJidGroup(r.id) })
+		return [...map.values()].filter((c) => c.name).sort((a, b) => a.name.localeCompare(b.name, 'ru'))
+	}
+	async checkNumbers(phones) {
+		const sock = this.requireSock()
+		const list = phones.map((p) => String(p).replace(/\D/g, '')).filter((p) => p.length >= 8)
+		const res = (await sock.onWhatsApp(...list)) || []
+		return list.map((p) => {
+			const r = res.find((x) => x.jid?.startsWith(p + '@'))
+			return { phone: p, exists: !!r?.exists, jid: r?.jid ? jidNormalizedUser(r.jid) : p + '@s.whatsapp.net' }
+		})
+	}
+
+	// ================================================================ профиль и приватность аккаунта
+	async getProfile() {
+		const sock = this.requireSock()
+		const me = this.meIds()[0]
+		const [st] = (await sock.fetchStatus(me).catch(() => null)) || []
+		const privacy = await sock.fetchPrivacySettings(true).catch(() => ({}))
+		return { id: me, name: this.state.me?.name, about: st?.status?.status || '', privacy }
+	}
+	async setProfile({ name, about, photo, removePhoto }) {
+		const sock = this.requireSock()
+		const me = this.meIds()[0]
+		if (typeof name === 'string' && name.trim()) {
+			await sock.updateProfileName(name.trim())
+			this.setState({ me: { ...this.state.me, name: name.trim() } })
+		}
+		if (typeof about === 'string') await sock.updateProfileStatus(about)
+		if (photo) await sock.updateProfilePicture(me, Buffer.from(photo))
+		if (removePhoto) await sock.removeProfilePicture(me)
+		if (photo || removePhoto) this.avatarCache.delete(me)
+	}
+	async setPrivacy(key, value) {
+		const sock = this.requireSock()
+		if (key === 'disappearing') return sock.updateDefaultDisappearingMode(Number(value) || 0)
+		const fn = PRIVACY_SETTERS[key]
+		if (!fn) throw new Error('Неизвестная настройка')
+		await sock[fn](value)
+	}
+
+	// ================================================================ группы
+	async createGroup(subject, participants) {
+		const sock = this.requireSock()
+		const jids = participants.map((p) => (p.includes('@') ? p : String(p).replace(/\D/g, '') + '@s.whatsapp.net'))
+		const g = await sock.groupCreate(subject, jids)
+		this.saveGroup(g)
+		this.store.upsertChat({ id: g.id, name: g.subject, ts: Math.floor(Date.now() / 1000) })
+		this.queueChat(g.id)
+		return g.id
+	}
+	async groupAction(chatId, action, payload = {}) {
+		const sock = this.requireSock()
+		const toJids = (list) => (list || []).map((p) => (p.includes('@') ? p : String(p).replace(/\D/g, '') + '@s.whatsapp.net'))
+		switch (action) {
+			case 'subject':
+				await sock.groupUpdateSubject(chatId, payload.subject)
+				break
+			case 'description':
+				await sock.groupUpdateDescription(chatId, payload.description || undefined)
+				break
+			case 'add':
+			case 'remove':
+			case 'promote':
+			case 'demote': {
+				const res = await sock.groupParticipantsUpdate(chatId, toJids(payload.participants), action)
+				const failed = (res || []).filter((r) => r.status !== '200')
+				if (failed.length) return { failed: failed.map((f) => ({ jid: f.jid, status: f.status })) }
+				break
+			}
+			case 'invite':
+				return { link: 'https://chat.whatsapp.com/' + (await sock.groupInviteCode(chatId)) }
+			case 'revoke':
+				return { link: 'https://chat.whatsapp.com/' + (await sock.groupRevokeInvite(chatId)) }
+			case 'setting':
+				await sock.groupSettingUpdate(chatId, payload.setting)
+				break
+			case 'photo':
+				await sock.updateProfilePicture(chatId, Buffer.from(payload.photo))
+				this.avatarCache.delete(chatId)
+				break
+			case 'leave':
+				await sock.groupLeave(chatId)
+				break
+			default:
+				throw new Error('Неизвестное действие')
+		}
+		return {}
+	}
+	async joinGroup(link) {
+		const sock = this.requireSock()
+		const code = String(link).trim().split('/').pop()
+		return { chatId: await sock.groupAcceptInvite(code) }
+	}
+
+	// ================================================================ отложенные сообщения
+	scheduleAdd(chatId, text, at) {
+		if (!text?.trim()) throw new Error('Пустое сообщение')
+		if (!(at > Date.now())) throw new Error('Время уже прошло')
+		const id = this.store.addScheduled(chatId, text, at)
+		this.emit('scheduled.update')
+		return id
+	}
+	scheduleList(chatId) {
+		return this.store
+			.listScheduled()
+			.filter((s) => !chatId || s.chat_id === chatId)
+			.map((s) => ({ ...s, chatName: this.nameOf(s.chat_id) }))
+	}
+	scheduleCancel(id) {
+		this.store.deleteScheduled(id)
+		this.emit('scheduled.update')
+	}
+	async runScheduler() {
+		if (!this.sock || this.state.connection !== 'open') return
+		for (const s of this.store.dueScheduled(Date.now())) {
+			this.store.setScheduled(s.id, 'sending')
+			try {
+				await this.sock.sendMessage(s.chat_id, { text: s.text })
+				this.store.setScheduled(s.id, 'sent')
+			} catch (err) {
+				this.store.setScheduled(s.id, 'error', err.message)
+			}
+			this.emit('scheduled.update')
+		}
+	}
+
 }
 
 // перекодирование записи из браузера (webm/opus) в ogg/opus — формат голосовых WhatsApp

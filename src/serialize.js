@@ -17,6 +17,21 @@ const HIDDEN_TYPES = new Set([
 	'pinInChatMessage', 'secretEncryptedMessage'
 ])
 
+const argb = (n) => {
+	const v = Number(n) >>> 0
+	return `rgba(${(v >> 16) & 255},${(v >> 8) & 255},${v & 255},${(((v >>> 24) & 255) / 255).toFixed(2)})`
+}
+
+// текст для полнотекстового поиска
+export function searchText(msg) {
+	const d = serializeContent(msg)
+	if (!d || d.type === 'system') return null
+	return [d.text, d.media?.fileName, d.poll?.name, ...(d.poll?.options || []), d.location?.name, d.location?.address, d.contact?.name]
+		.filter(Boolean)
+		.join(' ')
+		.slice(0, 4000) || null
+}
+
 const b64 = (buf) => (buf && buf.length ? Buffer.from(buf).toString('base64') : undefined)
 
 export const msgTimestamp = (m) => toNumber(m.messageTimestamp) || 0
@@ -74,6 +89,11 @@ const STUB_TEXT = {
 
 // Только содержимое (без контекста чата)
 export function serializeContent(msg, nameOf = (j) => j?.split('@')[0]) {
+	// «антиудаление»: содержимое удалённого сообщения сохранено локально
+	if (msg._revoked) {
+		const inner = msg.message ? serializeContent({ ...msg, _revoked: undefined, messageStubType: undefined }, nameOf) : null
+		return inner ? { ...inner, deleted: true, kept: true } : { type: 'text', deleted: true }
+	}
 	if (msg.messageStubType === WAMessageStubType.REVOKE || (msg.message === null && msg.messageStubType)) {
 		if (msg.messageStubType === WAMessageStubType.REVOKE) return { type: 'text', deleted: true }
 	}
@@ -97,6 +117,8 @@ export function serializeContent(msg, nameOf = (j) => j?.split('@')[0]) {
 	if (type === 'conversation') out.text = content.conversation
 	else if (type === 'extendedTextMessage') {
 		out.text = m.text
+		if (m.backgroundArgb) out.bg = argb(m.backgroundArgb)
+		if (m.textArgb) out.fg = argb(m.textArgb)
 		if (m.matchedText || m.title) out.link = { url: m.matchedText || m.canonicalUrl, title: m.title, description: m.description, thumb: b64(m.jpegThumbnail) }
 	} else if (MEDIA_TYPES[type]) {
 		out.type = MEDIA_TYPES[type]

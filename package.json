@@ -18,6 +18,7 @@
   },
   "homepage": "https://github.com/nurislamgalizhan/wabaileys#readme",
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.4.0",
     "baileys": "7.0.0-rc14",
     "express": "^5.3.0",
     "pino": "^10.4.0",
