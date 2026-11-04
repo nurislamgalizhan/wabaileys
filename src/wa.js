@@ -24,7 +24,16 @@ import QRCode from 'qrcode'
 import { Store } from './db.js'
 import { msgTimestamp, previewText, serializeContent, unwrap } from './serialize.js'
 
-const DEFAULT_SETTINGS = { online: false, readReceipts: false }
+const DEFAULT_SETTINGS = { online: false, readReceipts: false, deviceName: '' }
+
+// Как устройство будет выглядеть в «Связанных устройствах» телефона.
+// Название = browser[0]. Полную историю WhatsApp гарантированно отдаёт «десктопу» Mac OS / Windows.
+export function browserFor(deviceName) {
+	const name = String(deviceName || '').trim()
+	if (!name || name === 'Mac OS') return Browsers.macOS('Desktop')
+	if (name === 'Windows') return Browsers.windows('Desktop')
+	return [name.slice(0, 40), 'Desktop', '1.0']
+}
 const MIME_EXT = {
 	'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
 	'video/mp4': 'mp4', 'video/3gpp': '3gp', 'audio/ogg': 'ogg', 'audio/mpeg': 'mp3',
@@ -317,7 +326,7 @@ export class WhatsApp extends EventEmitter {
 			version,
 			auth: state,
 			logger: this.logger.child({ module: 'baileys' }),
-			browser: Browsers.macOS('Desktop'), // «десктоп» получает полную историю
+			browser: browserFor(this.settings.deviceName), // «десктоп» получает полную историю
 			markOnlineOnConnect: this.settings.online && this.anyVisible(),
 			syncFullHistory: true,
 			shouldSyncHistoryMessage: () => true,
@@ -600,7 +609,14 @@ export class WhatsApp extends EventEmitter {
 		}
 	}
 	updateSettings(patch) {
-		for (const k of Object.keys(DEFAULT_SETTINGS)) if (typeof patch[k] === 'boolean') this.settings[k] = patch[k]
+		for (const k of ['online', 'readReceipts']) if (typeof patch[k] === 'boolean') this.settings[k] = patch[k]
+		if (typeof patch.deviceName === 'string' && patch.deviceName.trim() !== this.settings.deviceName) {
+			this.settings.deviceName = patch.deviceName.trim().slice(0, 40)
+			// имя передаётся при привязке: если вход ещё не выполнен — пересоздаём сокет с новым именем
+			if (!this.isRegistered() && this.sock) {
+				this.stop().then(() => this.start()).catch((err) => this.logger.error({ err }, 'restart failed'))
+			}
+		}
 		this.store.set('settings', this.settings)
 		this.presenceSent = null
 		this.syncPresence()

@@ -100,6 +100,7 @@ const S = {
 }
 
 let socket
+const isTouch = matchMedia('(hover: none)').matches
 
 // ============================================================ boot / gate
 async function boot() {
@@ -209,6 +210,7 @@ function renderLogin() {
 	show($('#pair-code'), !!st.pairingCode)
 	$('#pair-code').textContent = st.pairingCode || ''
 	$('#login-status').textContent = st.error || (st.connection === 'connecting' ? 'Подключение…' : '')
+	if (document.activeElement !== $('#device-name')) $('#device-name').value = st.settings?.deviceName || ''
 	if (qrMode && st.connection === 'close' && !st.error && !renderLogin.autostarted) {
 		renderLogin.autostarted = true
 		call('login.qr')
@@ -221,6 +223,10 @@ document.querySelectorAll('.tab').forEach((t) =>
 	})
 )
 $('#qr-retry').addEventListener('click', () => call('login.qr'))
+$('#device-save').addEventListener('click', async () => {
+	const r = await call('settings.set', { deviceName: $('#device-name').value })
+	toast(r.error || 'Сохранено. Отсканируйте новый QR или запросите код заново')
+})
 $('#login-code').addEventListener('submit', async (e) => {
 	e.preventDefault()
 	$('#login-status').textContent = 'Запрашиваем код…'
@@ -311,6 +317,7 @@ $('#chat-list').addEventListener('scroll', (e) => {
 	}
 })
 $('#chat-list').addEventListener('click', (e) => {
+	if (Date.now() - lastLongPress < 700) return
 	const item = e.target.closest('[data-chat]')
 	if (item) openChat(item.dataset.chat)
 })
@@ -318,12 +325,16 @@ $('#chat-list').addEventListener('contextmenu', (e) => {
 	const item = e.target.closest('[data-chat]')
 	if (!item) return
 	e.preventDefault()
-	const id = item.dataset.chat
+	if (Date.now() - lastLongPress < 1000) return
+	chatMenu(item.dataset.chat, e.clientX, e.clientY)
+})
+function chatMenu(id, x, y) {
 	const c = S.chats.get(id)
-	menu(e.clientX, e.clientY, [
+	menu(x, y, [
+		['Открыть', () => openChat(id)],
 		c?.unread ? ['Отметить прочитанным', () => markRead(id)] : ['Отметить непрочитанным', () => call('chat.unread', { chatId: id })]
 	])
-})
+}
 $('#search').addEventListener('input', (e) => {
 	S.query = e.target.value
 	renderChats()
@@ -366,6 +377,7 @@ async function openChat(id) {
 	show($('#empty'), false)
 	show($('#chat'))
 	$('#app').classList.add('chat-open')
+	navPush('chat')
 	if ($('#drawer').dataset.kind === 'info') closeDrawer()
 	renderChats()
 	renderChatHead()
@@ -378,7 +390,7 @@ async function openChat(id) {
 		S.waitingHistory = true
 		$('#older-status').textContent = 'Загрузка истории с телефона…'
 	}
-	$('#input').focus()
+	if (!isTouch) $('#input').focus() // на телефоне не открываем клавиатуру сразу
 	if (S.chats.get(id)?.isGroup) call('group.info', { chatId: id }).then((g) => {
 		if (S.current === id && g.group) {
 			S.group = g.group
@@ -386,7 +398,26 @@ async function openChat(id) {
 		}
 	})
 }
-function closeChat() {
+// ---- кнопка «Назад» телефона закрывает верхний экран, а не сайт
+const nav = []
+const navClosers = { chat: () => _closeChat(), drawer: () => _closeDrawer(), lightbox: () => _closeLightbox() }
+function navPush(kind) {
+	if (nav.includes(kind)) return
+	nav.push(kind)
+	history.pushState({ nav: nav.length }, '')
+}
+function navClose(kind) {
+	if (nav[nav.length - 1] === kind) return history.back() // popstate закроет
+	const i = nav.indexOf(kind)
+	if (i !== -1) nav.splice(i, 1)
+	navClosers[kind]()
+}
+window.addEventListener('popstate', () => {
+	const kind = nav.pop()
+	if (kind) navClosers[kind]()
+})
+const closeChat = () => navClose('chat')
+function _closeChat() {
 	S.current = null
 	show($('#chat'), false)
 	show($('#empty'))
@@ -609,7 +640,71 @@ $('#msg-list').addEventListener('click', (e) => {
 	const more = e.target.closest('[data-more]')
 	if (more) return messageMenu(more.dataset.more, e.clientX, e.clientY)
 })
+// Долгое нажатие → меню (Safari на iPhone не присылает contextmenu), свайп вправо → ответить
+let lastLongPress = 0
+function touchGestures(container, selector, onLong, onSwipe) {
+	let t = null
+	let start = null
+	let el = null
+	let swiping = false
+	container.addEventListener('touchstart', (e) => {
+		el = e.target.closest(selector)
+		if (!el || e.touches.length > 1) return
+		const p = e.touches[0]
+		start = { x: p.clientX, y: p.clientY }
+		swiping = false
+		t = setTimeout(() => {
+			t = null
+			lastLongPress = Date.now()
+			navigator.vibrate?.(15)
+			onLong(el, start.x, start.y)
+		}, 450)
+	}, { passive: true })
+	container.addEventListener('touchmove', (e) => {
+		if (!start || !el) return
+		const p = e.touches[0]
+		const dx = p.clientX - start.x
+		const dy = p.clientY - start.y
+		if (t && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
+			clearTimeout(t)
+			t = null
+		}
+		if (!onSwipe) return
+		if (!swiping && dx > 12 && Math.abs(dx) > Math.abs(dy) * 1.5) swiping = true
+		if (swiping) {
+			const shift = Math.max(0, Math.min(dx, 90))
+			el.style.transform = `translateX(${shift}px)`
+			el.classList.toggle('swipe-ready', shift > 60)
+		}
+	}, { passive: true })
+	const end = (e) => {
+		clearTimeout(t)
+		t = null
+		// после долгого нажатия браузер шлёт клик — он не должен нажать пункт открывшегося меню
+		if (e?.cancelable && Date.now() - lastLongPress < 1500 && start) e.preventDefault()
+		if (swiping && el) {
+			const ready = el.classList.contains('swipe-ready')
+			el.style.transform = ''
+			el.classList.remove('swipe-ready')
+			if (ready) onSwipe(el)
+		}
+		swiping = false
+		start = null
+		el = null
+	}
+	container.addEventListener('touchend', end, { passive: false })
+	container.addEventListener('touchcancel', end)
+}
+touchGestures(
+	$('#msg-list'),
+	'.msg[data-mid]',
+	(el, x, y) => messageMenu(el.dataset.mid, x, y),
+	(el) => setReply(S.messages.find((m) => m.id === el.dataset.mid))
+)
+touchGestures($('#chat-list'), '[data-chat]', (el, x, y) => chatMenu(el.dataset.chat, x, y))
+
 $('#msg-list').addEventListener('contextmenu', (e) => {
+	if (Date.now() - lastLongPress < 1000) return e.preventDefault()
 	const el = e.target.closest('[data-mid]')
 	if (!el || el.classList.contains('sys')) return
 	e.preventDefault()
@@ -658,7 +753,7 @@ input.addEventListener('input', () => {
 	}
 })
 input.addEventListener('keydown', (e) => {
-	if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+	if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !isTouch) {
 		e.preventDefault()
 		sendText()
 	}
@@ -819,8 +914,10 @@ function openDrawer(kind, title, html) {
 	$('#drawer-title').textContent = title
 	$('#drawer-body').innerHTML = html
 	show(d)
+	navPush('drawer')
 }
-function closeDrawer() {
+const closeDrawer = () => navClose('drawer')
+function _closeDrawer() {
 	$('#drawer').dataset.kind = ''
 	show($('#drawer'), false)
 }
@@ -901,13 +998,14 @@ function menu(x, y, items, quick) {
 	m.style.top = Math.max(8, Math.min(y, innerHeight - h - 8)) + 'px'
 	m.onclick = (e) => {
 		const b = e.target.closest('button')
-		if (!b) return
+		if (!b || Date.now() - lastLongPress < 500) return
 		show(m, false)
 		if (b.dataset.q != null) quick[b.dataset.q][1]()
 		else items[b.dataset.i][1]()
 	}
 }
 document.addEventListener('click', (e) => {
+	if (Date.now() - lastLongPress < 700) return
 	if (!e.target.closest('#ctx-menu') && !e.target.closest('[data-more]')) show($('#ctx-menu'), false)
 	if (!e.target.closest('#emoji-pop')) show($('#emoji-pop'), false)
 })
@@ -945,9 +1043,11 @@ function openLightbox(kind, src) {
 	const lb = $('#lightbox')
 	lb.innerHTML = `<div class="lb-bar"><a href="${src}?download=1" target="_blank">Скачать</a><button id="lb-close">Закрыть ✕</button></div>` + (kind === 'video' ? `<video src="${src}" controls autoplay playsinline></video>` : `<img src="${src}" alt="">`)
 	show(lb)
+	navPush('lightbox')
 	$('#lb-close').onclick = closeLightbox
 }
-function closeLightbox() {
+const closeLightbox = () => navClose('lightbox')
+function _closeLightbox() {
 	$('#lightbox').innerHTML = ''
 	show($('#lightbox'), false)
 }
@@ -981,5 +1081,7 @@ function applyTheme() {
 	else delete document.documentElement.dataset.theme
 }
 applyTheme()
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {})
 
 boot()

@@ -310,3 +310,47 @@ input[type='password'], input[type='tel'], input[type='text'], .field {
 	.voice, .doc { min-width: 200px; }
 	.voice audio { width: 210px; }
 }
+
+/* ------------------------------------------------ touch / phone */
+.msg { transition: transform .15s ease-out; }
+.msg.swipe-ready .bubble { filter: brightness(.93); }
+@media (hover: none) {
+	/* без лупы и системного меню iOS при долгом нажатии — у нас своё меню */
+	.bubble, .chat-item { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+	.bubble .more { display: none; }
+	.chat-item:hover { background: transparent; }
+	.chat-item:active { background: var(--hover); }
+	.icon-btn:hover { background: transparent; }
+	.icon-btn:active { background: var(--active); }
+}
+@media (max-width: 760px), (hover: none) {
+	/* 16px — иначе iPhone увеличивает страницу при фокусе на поле */
+	input, textarea, select, .composer textarea, .search input { font-size: 16px; }
+}
+/* «чёлка» и полоска жестов */
+@supports (padding: env(safe-area-inset-bottom)) {
+	.side-head, .chat-head, .drawer-head { padding-top: env(safe-area-inset-top); height: calc(60px + env(safe-area-inset-top)); }
+	.side-head, .chat-head, .drawer-head, .composer, .reply-bar { padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+	.composer { padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+	.chat-list { padding-bottom: env(safe-area-inset-bottom); }
+	.drawer-body { padding-bottom: calc(16px + env(safe-area-inset-bottom)); }
+	.lightbox .lb-bar { padding-top: calc(10px + env(safe-area-inset-top)); }
+	.toast { bottom: calc(24px + env(safe-area-inset-bottom)); }
+}
+@media (max-width: 760px) {
+	.down-btn { bottom: calc(80px + env(safe-area-inset-bottom, 0px)); right: 12px; }
+	.chat-item { height: 76px; }
+	.composer .icon-btn { width: 42px; height: 42px; }
+	.emoji-pop { left: 8px; right: 8px; grid-template-columns: repeat(auto-fill, 40px); }
+	.ctx-menu button { padding: 12px 18px; }
+	.ctx-menu .quick button { font-size: 24px; padding: 6px 8px; }
+	.login-card { padding: 20px; gap: 24px; }
+	.login-text ol { font-size: 15px; line-height: 1.7; }
+	.lightbox { padding: 0; }
+	.lightbox img, .lightbox video { max-height: 100%; }
+}
+
+.advanced { width: 100%; font-size: 13px; }
+.advanced summary { cursor: pointer; color: var(--accent-strong); }
+.advanced[open] { display: flex; flex-direction: column; gap: 8px; }
+.advanced p { margin: 6px 0 0; }

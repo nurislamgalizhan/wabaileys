@@ -2,7 +2,15 @@
 <html lang="ru">
 <head>
 	<meta charset="utf-8" />
-	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+	<meta name="theme-color" content="#f0f2f5" media="(prefers-color-scheme: light)" />
+	<meta name="theme-color" content="#202c33" media="(prefers-color-scheme: dark)" />
+	<meta name="apple-mobile-web-app-capable" content="yes" />
+	<meta name="mobile-web-app-capable" content="yes" />
+	<meta name="apple-mobile-web-app-title" content="WA Web" />
+	<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+	<link rel="manifest" href="/manifest.webmanifest" />
+	<link rel="apple-touch-icon" href="/icons/icon-180.png" />
 	<title>WA Web</title>
 	<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='46' fill='%2325d366'/><path d='M30 68l4-12a20 20 0 1 1 8 8z' fill='white'/></svg>" />
 	<link rel="stylesheet" href="/style.css" />
@@ -52,6 +60,13 @@
 					<div id="pair-code" class="pair-code hidden"></div>
 				</form>
 				<p id="login-status" class="muted"></p>
+				<details class="advanced">
+					<summary>Название устройства</summary>
+					<p class="muted">Так этот клиент будет называться на телефоне в «Связанных устройствах». С вариантами «Mac OS» и «Windows» гарантированно приходит полная история, со своим названием история может оказаться короче.</p>
+					<input id="device-name" type="text" list="device-presets" maxlength="40" placeholder="Mac OS" />
+					<datalist id="device-presets"><option value="Mac OS"></option><option value="Windows"></option></datalist>
+					<button class="btn small" id="device-save" type="button">Сохранить и обновить QR</button>
+				</details>
 			</div>
 		</div>
 	</section>
