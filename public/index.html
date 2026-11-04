@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>WA Web</title>
+	<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='46' fill='%2325d366'/><path d='M30 68l4-12a20 20 0 1 1 8 8z' fill='white'/></svg>" />
+	<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+	<!-- Пароль на интерфейс (если задан APP_PASSWORD) -->
+	<section id="gate" class="screen hidden">
+		<form id="gate-form" class="card">
+			<h1>Вход в панель</h1>
+			<input id="gate-pass" type="password" placeholder="Пароль" autocomplete="current-password" />
+			<button class="btn primary" type="submit">Войти</button>
+			<p id="gate-err" class="err"></p>
+		</form>
+	</section>
+
+	<!-- Авторизация в WhatsApp -->
+	<section id="login" class="screen hidden">
+		<div class="card login-card">
+			<div class="login-text">
+				<h1>Вход в WhatsApp</h1>
+				<ol id="login-steps-qr">
+					<li>Откройте WhatsApp на телефоне</li>
+					<li>Нажмите <b>Меню ⋮</b> или <b>Настройки ⚙</b> → <b>Связанные устройства</b></li>
+					<li>Нажмите <b>Привязка устройства</b></li>
+					<li>Наведите камеру на QR-код</li>
+				</ol>
+				<ol id="login-steps-code" class="hidden">
+					<li>Введите номер телефона и получите код</li>
+					<li>Откройте WhatsApp → <b>Связанные устройства</b> → <b>Привязка устройства</b></li>
+					<li>Нажмите <b>Привязать по номеру телефона</b></li>
+					<li>Введите 8-значный код с этой страницы</li>
+				</ol>
+				<div class="tabs">
+					<button class="tab active" data-mode="qr">QR-код</button>
+					<button class="tab" data-mode="code">По номеру телефона</button>
+				</div>
+			</div>
+			<div class="login-box">
+				<div id="login-qr">
+					<div id="qr-box" class="qr-box"><div class="spinner"></div></div>
+					<button id="qr-retry" class="btn hidden">Обновить QR-код</button>
+				</div>
+				<form id="login-code" class="hidden">
+					<label>Номер телефона в международном формате</label>
+					<input id="phone" type="tel" placeholder="+7 777 123 45 67" autocomplete="tel" />
+					<button class="btn primary" type="submit">Получить код</button>
+					<div id="pair-code" class="pair-code hidden"></div>
+				</form>
+				<p id="login-status" class="muted"></p>
+			</div>
+		</div>
+	</section>
+
+	<!-- Основной интерфейс -->
+	<section id="app" class="hidden">
+		<aside id="sidebar">
+			<header class="side-head">
+				<div id="me-avatar" class="avatar sm"></div>
+				<div class="privacy-flags" id="privacy-flags" title="Режимы приватности"></div>
+				<div class="spacer"></div>
+				<button class="icon-btn" id="btn-new" title="Новый чат">
+					<svg viewBox="0 0 24 24"><path d="M19 3H5a2 2 0 0 0-2 2v14l4-4h12a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-6 9h-2v-2H9V8h2V6h2v2h2v2h-2z"/></svg>
+				</button>
+				<button class="icon-btn" id="btn-settings" title="Настройки">
+					<svg viewBox="0 0 24 24"><path d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7zm7.4-2.5a7.6 7.6 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.4 7.4 0 0 0-1.7-1L15 3h-4l-.4 2.4a7.4 7.4 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1c.5.4 1.1.7 1.7 1L11 21h4l.4-2.4c.6-.3 1.2-.6 1.7-1l2.5 1 2-3.5z"/></svg>
+				</button>
+			</header>
+			<div id="sync-bar" class="sync-bar hidden"></div>
+			<div id="conn-bar" class="conn-bar hidden"></div>
+			<div class="search">
+				<input id="search" type="search" placeholder="Поиск чата" />
+			</div>
+			<div class="filters">
+				<button class="chip active" data-filter="all">Все</button>
+				<button class="chip" data-filter="unread">Непрочитанные</button>
+				<button class="chip" data-filter="groups">Группы</button>
+				<button class="chip" data-filter="archived">Архив</button>
+			</div>
+			<div id="chat-list" class="chat-list"></div>
+		</aside>
+
+		<main id="main">
+			<div id="empty" class="empty">
+				<div class="empty-inner">
+					<svg viewBox="0 0 24 24" class="empty-logo"><path d="M12 2a10 10 0 0 0-8.6 15.1L2 22l5-1.3A10 10 0 1 0 12 2z"/></svg>
+					<h2>WA Web</h2>
+					<p>Выберите чат слева, чтобы начать переписку.</p>
+					<p class="muted" id="empty-privacy"></p>
+				</div>
+			</div>
+
+			<div id="chat" class="chat hidden">
+				<header class="chat-head">
+					<button class="icon-btn back" id="btn-back" title="Назад">
+						<svg viewBox="0 0 24 24"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg>
+					</button>
+					<div id="chat-avatar" class="avatar"></div>
+					<div class="chat-title" id="chat-title-wrap">
+						<div id="chat-name" class="name"></div>
+						<div id="chat-sub" class="sub"></div>
+					</div>
+					<button class="btn small hidden" id="btn-mark-read" title="Отправить собеседнику отчёт о прочтении">Отметить прочитанным</button>
+					<button class="icon-btn" id="btn-chat-menu" title="Меню">
+						<svg viewBox="0 0 24 24"><path d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm0 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4z"/></svg>
+					</button>
+				</header>
+				<div id="messages" class="messages">
+					<div id="older-status" class="older-status"></div>
+					<div id="msg-list"></div>
+				</div>
+				<button id="btn-down" class="down-btn hidden" title="Вниз">
+					<svg viewBox="0 0 24 24"><path d="M7.4 8.6 12 13.2l4.6-4.6L18 10l-6 6-6-6z"/></svg>
+				</button>
+				<div id="reply-bar" class="reply-bar hidden">
+					<div class="reply-inner"><div class="reply-name" id="reply-name"></div><div class="reply-text" id="reply-text"></div></div>
+					<button class="icon-btn" id="reply-cancel">✕</button>
+				</div>
+				<footer class="composer">
+					<button class="icon-btn" id="btn-emoji" title="Эмодзи">
+						<svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-3.5 6a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm7 0a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zM12 18a6 6 0 0 1-5.2-3h10.4A6 6 0 0 1 12 18z"/></svg>
+					</button>
+					<button class="icon-btn" id="btn-attach" title="Прикрепить">
+						<svg viewBox="0 0 24 24"><path d="M16.5 6.5v10a4.5 4.5 0 0 1-9 0V5a3 3 0 0 1 6 0v10.5a1.5 1.5 0 0 1-3 0V6.5H9v9a3 3 0 0 0 6 0V5a4.5 4.5 0 0 0-9 0v11.5a6 6 0 0 0 12 0v-10z"/></svg>
+					</button>
+					<input id="file-input" type="file" multiple hidden />
+					<div id="rec-bar" class="rec-bar hidden"><span class="rec-dot"></span><span id="rec-time">0:00</span><button class="btn small" id="rec-cancel">Отмена</button></div>
+					<textarea id="input" rows="1" placeholder="Введите сообщение"></textarea>
+					<button class="icon-btn send" id="btn-send" title="Отправить">
+						<svg viewBox="0 0 24 24" class="i-send"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
+						<svg viewBox="0 0 24 24" class="i-mic"><path d="M12 15a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v7a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V22h2v-3.1a7 7 0 0 0 6-6.9z"/></svg>
+					</button>
+					<div id="emoji-pop" class="emoji-pop hidden"></div>
+				</footer>
+			</div>
+		</main>
+
+		<!-- Боковая панель: настройки / инфо о чате -->
+		<aside id="drawer" class="drawer hidden">
+			<header class="drawer-head">
+				<button class="icon-btn" id="drawer-close">✕</button>
+				<h3 id="drawer-title"></h3>
+			</header>
+			<div id="drawer-body" class="drawer-body"></div>
+		</aside>
+	</section>
+
+	<div id="lightbox" class="lightbox hidden"></div>
+	<div id="ctx-menu" class="ctx-menu hidden"></div>
+	<div id="modal" class="modal hidden"></div>
+	<div id="toast" class="toast hidden"></div>
+
+	<script src="/vendor/socket.io/socket.io.min.js"></script>
+	<script src="/app.js"></script>
+</body>
+</html>
